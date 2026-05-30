@@ -17,6 +17,8 @@ extern "C" {
 #undef static
 
 #include <algorithm>
+#include <cerrno>
+#include <poll.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -138,6 +140,16 @@ static void handleGlobalRemoved (void* data, struct wl_registry* registry, uint3
 constexpr struct wl_registry_listener registryListener = {
     .global = handleGlobal,
     .global_remove = handleGlobalRemoved,
+};
+
+// xdg_wm_base.ping handler — required for GNOME Shell to consider
+// our xdg_toplevel windows responsive (otherwise shows "not responding")
+static void handleWmBasePing (void* data, struct xdg_wm_base* wmBase, uint32_t serial) {
+    xdg_wm_base_pong (wmBase, serial);
+}
+
+constexpr struct xdg_wm_base_listener wmBaseListener = {
+    .ping = handleWmBasePing,
 };
 
 void WaylandOpenGLDriver::initEGL () {
@@ -315,6 +327,12 @@ void WaylandOpenGLDriver::initWaylandRegistry () {
 	}
     }
 
+    // Register xdg_wm_base ping listener so GNOME Shell doesn't mark our
+    // xdg_toplevel windows as "not responding" (required for keepalive pings)
+    if (m_waylandContext.wmBase) {
+	xdg_wm_base_add_listener (m_waylandContext.wmBase, &wmBaseListener, this);
+    }
+
     // If xdg-output-manager is available, use it to get logical output positions
     if (m_waylandContext.xdgOutputManager) {
 	for (const auto& o : this->m_screens) {
@@ -440,13 +458,43 @@ void WaylandOpenGLDriver::dispatchEventQueue () {
     // TODO: FRAMETIME CONTROL SHOULD GO BACK TO THE CWALLPAPAERAPPLICATION ONCE ACTUAL PARTICLES ARE IMPLEMENTED
     // TODO: AS THOSE, MORE THAN LIKELY, WILL REQUIRE OF A DIFFERENT PROCESSING RATE
 
-    // TODO: WRITE A NON-BLOCKING VERSION OF THIS ONCE PARTICLE SIMULATION STARTS WORKING
-    // TODO: OTHERWISE wl_display_dispatch WILL BLOCK IF NO SURFACES ARE BEING DRAWN
     static float startTime, endTime, minimumTime = 1.0f / this->m_context.settings.render.maximumFPS;
     // get the start time of the frame
     startTime = this->getRenderTime ();
 
-    if (wl_display_dispatch (m_waylandContext.display) == -1) {
+    // Non-blocking dispatch: process pending events, then wait with a short
+    // timeout so we remain responsive to xdg_wm_base pings from the compositor.
+    // wl_display_dispatch blocks until an event arrives, which can cause
+    // GNOME Shell to show "not responding" for our xdg_toplevel windows.
+    while (wl_display_prepare_read (m_waylandContext.display) != 0) {
+	wl_display_dispatch_pending (m_waylandContext.display);
+    }
+    wl_display_flush (m_waylandContext.display);
+
+    // Poll for events with a generous timeout but not indefinite (500ms).
+    // This lets us wake up periodically even if the compositor is idle,
+    // keeping the GNOME Shell ping/pong alive.
+    struct pollfd fds = {
+	.fd = wl_display_get_fd (m_waylandContext.display),
+	.events = POLLIN,
+	.revents = 0,
+    };
+    int ret = poll (&fds, 1, 500);
+    if (ret == -1) {
+	if (errno != EINTR) {
+	    m_requestedExit = true;
+	    wl_display_cancel_read (m_waylandContext.display);
+	    return;
+	}
+	wl_display_cancel_read (m_waylandContext.display);
+    } else if (ret == 0) {
+	// Timeout — no events pending, cancel read
+	wl_display_cancel_read (m_waylandContext.display);
+    } else {
+	wl_display_read_events (m_waylandContext.display);
+    }
+
+    if (wl_display_dispatch_pending (m_waylandContext.display) == -1) {
 	m_requestedExit = true;
     }
 
