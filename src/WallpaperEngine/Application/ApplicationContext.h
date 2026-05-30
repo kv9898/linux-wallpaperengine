@@ -145,6 +145,8 @@ public:
 	    struct {
 		/** Which wlr-layer-shell layer to use for desktop backgrounds */
 		WAYLAND_LAYER layer;
+		/** Enable GNOME Shell extension compatibility mode (uses xdg-shell instead of wlr-layer-shell) */
+		bool gnome;
 	    } wayland;
 	} render;
 
@@ -218,6 +220,7 @@ public:
             },
             .wayland = {
                 .layer = WAYLAND_LAYER_BOTTOM,
+                .gnome = false,
             },
         },
         .audio = {

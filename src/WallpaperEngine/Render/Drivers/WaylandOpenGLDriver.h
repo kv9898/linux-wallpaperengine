@@ -22,6 +22,7 @@ class ApplicationContext;
 class WallpaperApplication;
 } // namespace WallpaperEngine::Application
 
+struct xdg_wm_base;
 struct zwlr_layer_shell_v1;
 struct zwlr_layer_surface_v1;
 struct zxdg_output_manager_v1;
@@ -54,6 +55,7 @@ public:
 	wl_compositor* compositor = nullptr;
 	wl_shm* shm = nullptr;
 	zwlr_layer_shell_v1* layerShell = nullptr;
+	xdg_wm_base* wmBase = nullptr;
 	wl_seat* seat = nullptr;
 	zxdg_output_manager_v1* xdgOutputManager = nullptr;
     };
@@ -102,6 +104,7 @@ private:
     uint32_t m_frameCounter = 0;
     ApplicationContext& m_context;
     WaylandMouseInput m_mouseInput;
+    bool m_gnomeMode = false;
 
     std::chrono::high_resolution_clock::time_point renderStart = std::chrono::high_resolution_clock::now ();
 };

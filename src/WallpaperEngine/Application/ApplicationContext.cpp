@@ -486,6 +486,18 @@ void ApplicationContext::loadSettingsFromArgv () {
 	    }
 	});
 
+
+    auto& gnomeGroup = program.add_group ("GNOME options");
+
+    gnomeGroup.add_argument ("--gnome")
+        .help (
+            "GNOME Shell extension compatibility mode. Uses xdg-shell windows instead of wlr-layer-shell "
+            "surfaces, allowing the companion GNOME Shell extension to clone the output as a desktop background. "
+            "Requires --screen-root."
+        )
+        .flag ()
+        .action ([this] (const std::string&) -> void { this->settings.render.wayland.gnome = true; });
+
     auto& performanceGroup = program.add_group ("Performance options");
 
     performanceGroup.add_argument ("-f", "--fps")
