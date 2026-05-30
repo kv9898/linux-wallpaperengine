@@ -10,6 +10,8 @@
 Bring **Wallpaper Engine**-style live wallpapers to Linux! This project allows you to run animated wallpapers from Steam's Wallpaper Engine right on your desktop.
 
 > This is a fork of [Almamu/linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine) with added **GNOME/Wayland support** via a companion GNOME Shell extension.
+>
+> ⚠️ **The `main` branch may be outdated.** For the latest code (especially GNOME support), use the [`gnome`](https://github.com/kv9898/linux-wallpaperengine/tree/gnome) branch.
 
 ---
 
@@ -113,7 +115,7 @@ linux-wallpaperengine --assets-dir /path/to/assets
 Clone the repo:
 
 ```bash
-git clone --recurse-submodules https://github.com/kv9898/linux-wallpaperengine.git
+git clone --recurse-submodules --branch gnome https://github.com/kv9898/linux-wallpaperengine.git
 cd linux-wallpaperengine
 ```
 
