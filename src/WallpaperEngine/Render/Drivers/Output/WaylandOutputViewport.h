@@ -14,6 +14,9 @@
 #include <WallpaperEngine/Input/MouseInput.h>
 #include <glm/vec2.hpp>
 
+struct xdg_surface;
+struct xdg_toplevel;
+struct xdg_wm_base;
 struct zwlr_layer_shell_v1;
 struct zwlr_layer_surface_v1;
 struct zxdg_output_v1;
@@ -46,6 +49,8 @@ namespace Output {
 	EGLSurface eglSurface = nullptr;
 	wl_surface* surface = nullptr;
 	zwlr_layer_surface_v1* layerSurface = nullptr;
+	xdg_surface* xdgSurface = nullptr;
+	xdg_toplevel* xdgToplevel = nullptr;
 	wl_callback* frameCallback = nullptr;
 	glm::dvec2 mousePos = { 0, 0 };
 	WallpaperEngine::Input::MouseClickStatus leftClick = WallpaperEngine::Input::MouseClickStatus::Released;
@@ -57,7 +62,9 @@ namespace Output {
 	zxdg_output_v1* xdgOutput = nullptr;
 
 	void setupLS ();
+	void setupXdgWindow ();
 	void setupXdgOutput (zxdg_output_manager_v1* manager);
+	std::string buildWindowTitle () const;
 
 	/**
 	 * Activates output's context for drawing

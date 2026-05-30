@@ -117,6 +117,9 @@ handleGlobal (void* data, struct wl_registry* registry, uint32_t name, const cha
     } else if (strcmp (interface, zwlr_layer_shell_v1_interface.name) == 0) {
 	driver->getWaylandContext ()->layerShell
 	    = static_cast<zwlr_layer_shell_v1*> (wl_registry_bind (registry, name, &zwlr_layer_shell_v1_interface, 1));
+    } else if (strcmp (interface, xdg_wm_base_interface.name) == 0) {
+	driver->getWaylandContext ()->wmBase
+	    = static_cast<xdg_wm_base*> (wl_registry_bind (registry, name, &xdg_wm_base_interface, 1));
     } else if (strcmp (interface, wl_seat_interface.name) == 0) {
 	driver->getWaylandContext ()->seat
 	    = static_cast<wl_seat*> (wl_registry_bind (registry, name, &wl_seat_interface, 1));
@@ -232,7 +235,7 @@ void WaylandOpenGLDriver::finishEGL () const {
 }
 
 void WaylandOpenGLDriver::onLayerClose (Output::WaylandOutputViewport* viewport) {
-    sLog.error ("Compositor closed our LS, freeing data...");
+    sLog.error ("Compositor closed our surface, freeing data...");
 
     if (viewport->eglSurface) {
 	eglDestroySurface (m_eglContext.display, viewport->eglSurface);
@@ -244,6 +247,14 @@ void WaylandOpenGLDriver::onLayerClose (Output::WaylandOutputViewport* viewport)
 
     if (viewport->layerSurface) {
 	zwlr_layer_surface_v1_destroy (viewport->layerSurface);
+    }
+
+    if (viewport->xdgToplevel) {
+	xdg_toplevel_destroy (viewport->xdgToplevel);
+    }
+
+    if (viewport->xdgSurface) {
+	xdg_surface_destroy (viewport->xdgSurface);
     }
 
     if (viewport->xdgOutput) {
@@ -275,6 +286,8 @@ WaylandOpenGLDriver::WaylandOpenGLDriver (ApplicationContext& context, Wallpaper
 }
 
 void WaylandOpenGLDriver::initWaylandRegistry () {
+    m_gnomeMode = m_context.settings.render.wayland.gnome;
+
     m_waylandContext.display = wl_display_connect (nullptr);
 
     if (!m_waylandContext.display) {
@@ -287,9 +300,19 @@ void WaylandOpenGLDriver::initWaylandRegistry () {
     wl_display_dispatch (m_waylandContext.display);
     wl_display_roundtrip (m_waylandContext.display);
 
-    if (!m_waylandContext.compositor || !m_waylandContext.shm || !m_waylandContext.layerShell
-	|| this->m_screens.empty ()) {
-	sLog.exception ("Failed to bind to required interfaces");
+    if (m_gnomeMode) {
+	if (!m_waylandContext.compositor || !m_waylandContext.shm || !m_waylandContext.wmBase
+	    || this->m_screens.empty ()) {
+	    sLog.exception (
+		"Failed to bind to required GNOME interfaces. "
+		"xdg_wm_base, wl_compositor, and wl_shm are required."
+	    );
+	}
+    } else {
+	if (!m_waylandContext.compositor || !m_waylandContext.shm || !m_waylandContext.layerShell
+	    || this->m_screens.empty ()) {
+	    sLog.exception ("Failed to bind to required interfaces");
+	}
     }
 
     // If xdg-output-manager is available, use it to get logical output positions
@@ -328,7 +351,11 @@ void WaylandOpenGLDriver::setupOutputLayerSurfaces () {
 	    continue;
 	}
 
-	o->setupLS ();
+	if (m_gnomeMode) {
+	    o->setupXdgWindow ();
+	} else {
+	    o->setupLS ();
+	}
 	any = true;
     }
 
@@ -376,6 +403,11 @@ WaylandOpenGLDriver::~WaylandOpenGLDriver () {
 	    zxdg_output_v1_destroy (screen->xdgOutput);
 	    screen->xdgOutput = nullptr;
 	}
+    }
+
+    // destroy xdg_wm_base
+    if (m_waylandContext.wmBase) {
+	xdg_wm_base_destroy (m_waylandContext.wmBase);
     }
 
     // stop EGL
