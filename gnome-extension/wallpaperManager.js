@@ -2,9 +2,10 @@
  * linux-wallpaperengine GNOME Shell Extension - Wallpaper Manager
  *
  * This intentionally follows gnome-ext-hanabi's Shell-side structure:
- *   - LiveWallpaper clones a renderer MetaWindowActor into GNOME's background.
- *   - ManagedWindow parses state from the renderer title and keeps that real
- *     renderer window minimized, bottomed, and positioned.
+ *   - LiveWallpaper clones the renderer's surface actor into GNOME's background.
+ *   - ManagedWindow parses state from the renderer title, minimizes the renderer
+ *     window (so it doesn't cover the desktop), and pins the surface container
+ *     actor at (0,0) so it remains composited.
  *   - Shell overrides hide renderer windows from overview, Alt+Tab, and apps.
  *
  * Window title format (set by the C++ renderer):
@@ -21,7 +22,6 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Background from 'resource:///org/gnome/shell/ui/background.js';
-import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import * as WorkspaceThumbnail from 'resource:///org/gnome/shell/ui/workspaceThumbnail.js';
@@ -29,7 +29,6 @@ import {InjectionManager} from 'resource:///org/gnome/shell/extensions/extension
 
 const APPLICATION_ID = '@linux-wallpaperengine!';
 const BACKGROUND_FADE_ANIMATION_TIME = 1000;
-const SHELL_MAJOR = parseInt(Config.PACKAGE_VERSION.split('.')[0]);
 
 function getWindowTitle(window) {
     try {
@@ -79,14 +78,14 @@ const LiveWallpaper = GObject.registerClass({
 
     _applyWallpaper() {
         const operation = () => {
-            const renderer = this._getRenderer();
+            const source = this._getSource();
 
-            if (!renderer) {
+            if (!source) {
                 return GLib.SOURCE_CONTINUE;
             }
 
             this._wallpaper = new Clutter.Clone({
-                source: renderer,
+                source,
                 pivot_point: new Graphene.Point({x: 0.5, y: 0.5}),
             });
             this._wallpaper.connect('destroy', () => {
@@ -107,7 +106,20 @@ const LiveWallpaper = GObject.registerClass({
         }
     }
 
-    _getRenderer() {
+    /**
+     * Find the best source actor to clone.
+     *
+     * Cloning the MetaWindowActor directly has a problem: when the window is
+     * minimized, some Mutter versions make MetaWindowActor.paint() return
+     * early, producing a static snapshot in the clone.
+     *
+     * Instead we clone the *surface container* child of the window actor.
+     * This child holds the actual Wayland/X11 surface texture and its paint
+     * function doesn't check window state — it always paints the latest
+     * committed buffer.  The ManagedWindow pins this child at (0,0) so it
+     * stays accessible even while the window is minimized.
+     */
+    _getSource() {
         let windowActors = [];
         try {
             windowActors = global.get_window_actors(false);
@@ -116,15 +128,41 @@ const LiveWallpaper = GObject.registerClass({
         }
 
         const rendererActors = windowActors.filter(isRendererActor);
-        log(`lwpe: found ${rendererActors.length} renderer actor(s), target monitor ${this._monitorIndex}`);
-
-        return rendererActors.find(actor => {
+        const renderer = rendererActors.find(actor => {
             try {
                 return actor.meta_window.get_monitor() === this._monitorIndex;
             } catch (e) {
                 return false;
             }
-        }) ?? null;
+        });
+
+        if (!renderer) return null;
+
+        // Try known surface-container type names (Wayland → X11 fallback)
+        const children = renderer.get_children?.() ?? [];
+        const surfaceTypes = [
+            'MetaSurfaceContainerActorWayland',
+            'MetaSurfaceActorWayland',
+            'MetaSurfaceContainerActorX11',
+            'MetaSurfaceActorX11',
+        ];
+        for (const typeName of surfaceTypes) {
+            const surface = children.find(c => {
+                try { return GObject.type_name(c) === typeName; } catch (e) { return false; }
+            });
+            if (surface) {
+                log(`lwpe: cloning surface actor ${typeName}`);
+                return surface;
+            }
+        }
+
+        // Unknown surface type — log children for debugging & fall back
+        const childTypes = children.map(c => {
+            try { return GObject.type_name(c); } catch (e) { return '?'; }
+        });
+        log(`lwpe: no known surface child, children: [${childTypes.join(', ')}]`);
+
+        return renderer;
     }
 
     _fade(visible = true) {
@@ -173,10 +211,8 @@ class ManagedWindow {
             }
         }));
         this._signals.push(this._window.connect('notify::minimized', () => {
-            if (this._states.keepMinimized) {
-                if (!this._window.minimized) this._window.minimize();
-            } else {
-                if (this._window.minimized) this._window.unminimize();
+            if (this._states.keepMinimized && !this._window.minimized) {
+                this._window.minimize();
             }
         }));
         this._signals.push(this._window.connect('position-changed', () => {
@@ -186,20 +222,45 @@ class ManagedWindow {
             }
         }));
 
-        if (SHELL_MAJOR === 45) {
-            const windowActor = this._window.get_compositor_private?.();
-            this._surfaceContainer = windowActor?.get_children?.().find(child =>
-                GObject.type_name(child) === 'MetaSurfaceContainerActorWayland'
-            );
+        // GNOME 45+ (issue #3159): when a window is minimized, Mutter
+        // moves the surface container actor to a negative position to
+        // hide it.  We pin it at (0,0) so the Clutter.Clone — which
+        // now sources from this child directly — always sees the
+        // latest frame at the correct position.
+        this._pinSurfaceContainer();
 
-            if (this._surfaceContainer) {
-                this._surfacePositionId = this._surfaceContainer.connect('notify::position', () => {
-                    this._surfaceContainer.set_position(0, 0);
+        this._parseTitle();
+    }
+
+    _pinSurfaceContainer() {
+        const windowActor = this._window.get_compositor_private?.();
+        const children = windowActor?.get_children?.() ?? [];
+
+        const surfaceTypes = [
+            'MetaSurfaceContainerActorWayland',
+            'MetaSurfaceActorWayland',
+            'MetaSurfaceContainerActorX11',
+            'MetaSurfaceActorX11',
+        ];
+        for (const typeName of surfaceTypes) {
+            const surface = children.find(c => {
+                try { return GObject.type_name(c) === typeName; } catch (e) { return false; }
+            });
+            if (surface) {
+                this._surfaceContainer = surface;
+                this._surfacePositionId = surface.connect('notify::position', () => {
+                    surface.set_position(0, 0);
                 });
+                log(`lwpe: pinning surface container ${typeName} at (0,0)`);
+                return;
             }
         }
 
-        this._parseTitle();
+        // Log children types for debugging
+        const childTypes = children.map(c => {
+            try { return GObject.type_name(c); } catch (e) { return '?'; }
+        });
+        log(`lwpe: no surface container found, children: [${childTypes.join(', ')}]`);
     }
 
     _parseTitle() {
@@ -224,10 +285,8 @@ class ManagedWindow {
         if (this._states.keepAtBottom) {
             this._window.lower();
         }
-        if (this._states.keepMinimized) {
-            if (!this._window.minimized) this._window.minimize();
-        } else {
-            if (this._window.minimized) this._window.unminimize();
+        if (this._states.keepMinimized && !this._window.minimized) {
+            this._window.minimize();
         }
         if (this._states.keepPosition) {
             const [x, y] = this._states.position;

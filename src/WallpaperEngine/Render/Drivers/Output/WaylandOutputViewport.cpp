@@ -291,7 +291,7 @@ std::string WaylandOutputViewport::buildWindowTitle () const {
 	+ ",\"height\":" + std::to_string (this->size.y * this->scale)
 	+ ",\"position\":[" + std::to_string (this->globalPosition.x)
 	+ "," + std::to_string (this->globalPosition.y)
-	+ "],\"keepAtBottom\":true,\"keepMinimized\":false,\"keepPosition\":true"
+	+ "],\"keepAtBottom\":true,\"keepMinimized\":true,\"keepPosition\":true"
 	+ "}";
 }
 
