@@ -471,15 +471,16 @@ void WaylandOpenGLDriver::dispatchEventQueue () {
     }
     wl_display_flush (m_waylandContext.display);
 
-    // Poll for events with a generous timeout but not indefinite (500ms).
-    // This lets us wake up periodically even if the compositor is idle,
-    // keeping the GNOME Shell ping/pong alive.
+    // Poll for events with a timeout. In GNOME mode the source xdg windows are
+    // minimized by the Shell extension, so frame callbacks can stop arriving;
+    // keep waking at the target frame cadence and commit fresh buffers anyway.
+    const int pollTimeoutMs = m_gnomeMode ? std::max (1, static_cast<int> (minimumTime * 1000.0f)) : 500;
     struct pollfd fds = {
 	.fd = wl_display_get_fd (m_waylandContext.display),
 	.events = POLLIN,
 	.revents = 0,
     };
-    int ret = poll (&fds, 1, 500);
+    int ret = poll (&fds, 1, pollTimeoutMs);
     if (ret == -1) {
 	if (errno != EINTR) {
 	    m_requestedExit = true;
@@ -496,6 +497,12 @@ void WaylandOpenGLDriver::dispatchEventQueue () {
 
     if (wl_display_dispatch_pending (m_waylandContext.display) == -1) {
 	m_requestedExit = true;
+    }
+
+    if (m_gnomeMode) {
+	for (const auto& viewport : this->getOutput ().getViewports () | std::views::values) {
+	    this->getApp ().update (viewport);
+	}
     }
 
     m_frameCounter++;

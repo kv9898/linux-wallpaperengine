@@ -1,483 +1,565 @@
 /**
- * linux-wallpaperengine GNOME Shell Extension — Wallpaper Manager
+ * linux-wallpaperengine GNOME Shell Extension - Wallpaper Manager
  *
- * Core logic:
- *   1. Discovers renderer windows (title starts with @linux-wallpaperengine!)
- *   2. Injects Clutter.Clone actors into GNOME's desktop background
- *   3. Hides renderer windows from overview, Alt+Tab, dock, and app list
- *   4. Keeps renderer windows sticky, at the bottom, and never minimized
+ * This intentionally follows gnome-ext-hanabi's Shell-side structure:
+ *   - LiveWallpaper clones the renderer's surface actor into GNOME's background.
+ *   - ManagedWindow parses state from the renderer title, minimizes the renderer
+ *     window (so it doesn't cover the desktop), and pins the surface container
+ *     actor at (0,0) so it remains composited.
+ *   - Shell overrides hide renderer windows from overview, Alt+Tab, and apps.
  *
  * Window title format (set by the C++ renderer):
- *   @linux-wallpaperengine!{"monitor":"HDMI-1","width":1920,"height":1080}
+ *   @linux-wallpaperengine!{"monitor":"HDMI-1","position":[0,0],
+ *     "keepAtBottom":true,"keepMinimized":true,"keepPosition":true}
  */
 
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
+import Graphene from 'gi://Graphene';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
-import Graphene from 'gi://Graphene';
+import St from 'gi://St';
 
-import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Background from 'resource:///org/gnome/shell/ui/background.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import * as WorkspaceThumbnail from 'resource:///org/gnome/shell/ui/workspaceThumbnail.js';
 import {InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const APPLICATION_ID = '@linux-wallpaperengine!';
+const BACKGROUND_FADE_ANIMATION_TIME = 1000;
 
-/**
- * Managed wallpaper: wraps one renderer window, its Clutter.Clone, and
- * enforces window state (never minimized, always at bottom, sticky).
- */
-class ManagedWallpaper {
-    constructor(metaWindow, windowActor, info) {
-        this.metaWindow = metaWindow;
-        this.windowActor = windowActor;
-        this.info = info;
-        this._clone = null;
-        this._backgroundActor = null;
-        this._signalIds = [];
+function getWindowTitle(window) {
+    try {
+        return window?.get_title?.() || window?.title || '';
+    } catch (e) {
+        return '';
+    }
+}
 
-        // Keep window sticky (on all workspaces) and at the bottom
-        this._enforceWindowState();
+function isRendererWindow(window) {
+    return getWindowTitle(window).startsWith(APPLICATION_ID);
+}
+
+function isRendererActor(actor) {
+    const window = actor?.meta_window || actor?.get_meta_window?.();
+    return isRendererWindow(window);
+}
+
+const LiveWallpaper = GObject.registerClass({
+    GTypeName: 'LWPELiveWallpaper',
+}, class LiveWallpaper extends St.Widget {
+    constructor(backgroundActor) {
+        super({
+            layout_manager: new Clutter.BinLayout(),
+            width: backgroundActor.width,
+            height: backgroundActor.height,
+            reactive: false,
+            x_expand: true,
+            y_expand: true,
+            opacity: 0,
+        });
+
+        this._backgroundActor = backgroundActor;
+        this._monitorIndex = backgroundActor.monitor;
+        this._wallpaper = null;
+        this._retryId = 0;
+        this._destroying = false;
+
+        const monitor = Main.layoutManager.monitors[this._monitorIndex];
+        this._monitorWidth = monitor?.width ?? backgroundActor.width;
+        this._monitorHeight = monitor?.height ?? backgroundActor.height;
+
+        backgroundActor.layout_manager = new Clutter.BinLayout();
+        backgroundActor.add_child(this);
+
+        this._applyWallpaper();
+    }
+
+    _applyWallpaper() {
+        // The retry loop runs forever. On each tick it checks whether the
+        // current clone's source is still alive and finds a new renderer
+        // window when the old one goes away.
+        let _firstRun = true;
+        const operation = () => {
+            if (this._destroying) return GLib.SOURCE_REMOVE;
+
+            // Detect when the current clone's source has gone stale
+            const cloneSource = this._wallpaper?.get_source?.();
+            const sourceAlive = cloneSource && !this._isActorDisposed(cloneSource);
+
+            if (!sourceAlive && this._wallpaper) {
+                // Old renderer window is gone — tear down the clone
+                this._wallpaper.destroy();
+                this._wallpaper = null;
+                log(`lwpe: renderer gone on monitor ${this._monitorIndex}`);
+            }
+
+            if (!this._wallpaper) {
+                const source = this._getSource();
+                if (source) {
+                    this._wallpaper = new Clutter.Clone({
+                        source,
+                        pivot_point: new Graphene.Point({x: 0.5, y: 0.5}),
+                    });
+                    this._wallpaper.connect('destroy', () => {
+                        this._wallpaper = null;
+                    });
+
+                    this._wallpaper.set_size(this._monitorWidth, this._monitorHeight);
+                    this.add_child(this._wallpaper);
+                    this._fade();
+                    log(`lwpe: wallpaper applied on monitor ${this._monitorIndex}`);
+                } else if (_firstRun) {
+                    log(`lwpe: no renderer yet for monitor ${this._monitorIndex}, retrying...`);
+                }
+            }
+
+            _firstRun = false;
+            return GLib.SOURCE_CONTINUE;
+        };
+
+        this._retryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, operation);
     }
 
     /**
-     * Prevent the renderer window from being minimized or raised.
-     * If the window minimizes, Mutter stops compositing it, which
-     * kills the Clutter.Clone source and shows the static wallpaper.
+     * Safely check whether a GObject actor has been disposed.
      */
-    _enforceWindowState() {
-        if (!this.metaWindow) return;
-
-        // Make sticky so it's always available on every workspace
-        try { this.metaWindow.sticky = true; } catch (e) {}
-
-        // Put it at the very bottom of the stack
-        try { this.metaWindow.lower(); } catch (e) {}
-
-        // Prevent minimization: re-map if minimized
+    _isActorDisposed(actor) {
         try {
-            const id = this.metaWindow.connect('notify::minimized', () => {
-                if (this.metaWindow.minimized) {
-                    this.metaWindow.unminimize();
-                    this.metaWindow.lower();
-                }
-            });
-            this._signalIds.push(id);
-        } catch (e) {}
-
-        // Prevent being raised above other windows
-        try {
-            const id = this.metaWindow.connect('raised', () => {
-                this.metaWindow.lower();
-            });
-            this._signalIds.push(id);
-        } catch (e) {}
-
-        // Keep it at bottom even if something tries to make it 'above'
-        try {
-            const id = this.metaWindow.connect('notify::above', () => {
-                if (this.metaWindow.above) {
-                    this.metaWindow.unmake_above();
-                }
-            });
-            this._signalIds.push(id);
-        } catch (e) {}
+            // Accessing any property on a disposed object throws
+            void actor.get_parent?.();
+            return false;
+        } catch (e) {
+            return true;
+        }
     }
 
-    inject(backgroundActor) {
-        if (!backgroundActor || !this.windowActor) return;
+    /**
+     * Find the MetaWindowActor to clone.
+     *
+     * We clone the MetaWindowActor directly, just like gnome-ext-hanabi.
+     * The ManagedWindow keeps the window minimized and pins its surface
+     * container at (0,0) so the clone always paints the latest frame.
+     *
+     * Monitor matching is done first by meta_window.get_monitor() (index),
+     * and if that fails, by parsing the "monitor" name from the window
+     * title JSON and resolving it to a monitor index.
+     */
+    _getSource() {
+        let windowActors = [];
+        try {
+            windowActors = global.get_window_actors(false);
+        } catch (e) {
+            log(`lwpe: get_window_actors(false) threw: ${e.message}`);
+            windowActors = global.get_window_actors();
+        }
 
-        this.remove();
+        const rendererActors = windowActors.filter(isRendererActor);
+        if (rendererActors.length === 0) {
+            return null;
+        }
 
-        this._clone = new Clutter.Clone({
-            source: this.windowActor,
-            pivot_point: new Graphene.Point({x: 0.5, y: 0.5}),
+        // First try: match by monitor index
+        let renderer = rendererActors.find(actor => {
+            try {
+                return actor.meta_window.get_monitor() === this._monitorIndex;
+            } catch (e) {
+                return false;
+            }
         });
 
-        const width = backgroundActor.width || this.info.width;
-        const height = backgroundActor.height || this.info.height;
-        this._clone.set_size(width, height);
-        this._clone.set_position(0, 0);
+        if (renderer) return renderer;
 
-        backgroundActor.add_child(this._clone);
-        this._clone.lower_bottom();
-        this._backgroundActor = backgroundActor;
+        // Second try: parse monitor name from window title and resolve to index
+        const monitors = Main.layoutManager.monitors;
+        for (const actor of rendererActors) {
+            try {
+                const title = getWindowTitle(actor.meta_window);
+                const jsonStr = title.substring(APPLICATION_ID.length);
+                const info = JSON.parse(jsonStr);
+                if (info.monitor) {
+                    // Find the monitor index whose connector name matches
+                    const idx = monitors.findIndex(m => m?.connector === info.monitor);
+                    if (idx !== -1 && idx === this._monitorIndex) {
+                        log(`lwpe: matched renderer by connector "${info.monitor}" → monitor ${idx}`);
+                        return actor;
+                    }
+                    // Also log what monitors are available for debugging
+                    const connectors = monitors.map((m, i) => `[${i}]=${m?.connector || '?'}`).join(', ');
+                    log(`lwpe: renderer for "${info.monitor}", monitor ${this._monitorIndex}, available: ${connectors}`);
+                }
+            } catch (e) {
+                // Skip title parse errors
+            }
+        }
 
-        this._clone.opacity = 0;
-        this._clone.ease({
-            opacity: 255,
-            duration: 1000,
+        // Last resort: if we have exactly one renderer and one monitor, use it
+        if (rendererActors.length === 1 && monitors.length === 1) {
+            log('lwpe: falling back to single-renderer match');
+            return rendererActors[0];
+        }
+
+        return null;
+    }
+
+    _fade(visible = true) {
+        this.ease({
+            opacity: visible ? 255 : 0,
+            duration: BACKGROUND_FADE_ANIMATION_TIME,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
     }
 
-    remove() {
-        if (this._clone) {
-            const clone = this._clone;
-            this._clone = null;
-            clone.ease({
-                opacity: 0,
-                duration: 300,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                onComplete: () => { clone.destroy(); },
-            });
+    destroy() {
+        this._destroying = true;
+        if (this._retryId) {
+            GLib.source_remove(this._retryId);
+            this._retryId = 0;
         }
-        this._backgroundActor = null;
+        if (this._wallpaper) {
+            this._wallpaper.destroy();
+            this._wallpaper = null;
+        }
+
+        super.destroy();
+    }
+});
+
+class ManagedWindow {
+    constructor(window) {
+        this._window = window;
+        this._signals = [];
+        this._surfaceContainer = null;
+        this._surfacePositionId = 0;
+        this._states = {
+            position: [0, 0],
+            keepAtBottom: false,
+            keepMinimized: false,
+            keepPosition: false,
+        };
+
+        this._signals.push(this._window.connect('notify::title', () => {
+            this._parseTitle();
+        }));
+        this._signals.push(this._window.connect_after('shown', () => {
+            if (this._states.keepMinimized) this._window.minimize();
+        }));
+        this._signals.push(this._window.connect_after('raised', () => {
+            if (this._states.keepAtBottom) this._window.lower();
+        }));
+        this._signals.push(this._window.connect('notify::above', () => {
+            if (this._states.keepAtBottom && this._window.above) {
+                this._window.unmake_above();
+            }
+        }));
+        this._signals.push(this._window.connect('notify::minimized', () => {
+            if (this._states.keepMinimized && !this._window.minimized) {
+                this._window.minimize();
+            }
+        }));
+        this._signals.push(this._window.connect('position-changed', () => {
+            if (this._states.keepPosition) {
+                const [x, y] = this._states.position;
+                this._window.move_frame(true, x, y);
+            }
+        }));
+
+        // GNOME 45+ (issue #3159): when a window is minimized, Mutter
+        // moves the surface container actor to a negative position to
+        // hide it.  We pin it at (0,0) so the Clutter.Clone — which
+        // now sources from this child directly — always sees the
+        // latest frame at the correct position.
+        this._pinSurfaceContainer();
+
+        this._parseTitle();
     }
 
-    destroy() {
-        if (this._clone) {
-            this._clone.destroy();
-            this._clone = null;
+    _pinSurfaceContainer() {
+        const windowActor = this._window.get_compositor_private?.();
+        const children = windowActor?.get_children?.() ?? [];
+
+        const surfaceTypes = [
+            'MetaSurfaceContainerActorWayland',
+            'MetaSurfaceActorWayland',
+            'MetaSurfaceContainerActorX11',
+            'MetaSurfaceActorX11',
+        ];
+        for (const typeName of surfaceTypes) {
+            const surface = children.find(c => {
+                try { return GObject.type_name(c) === typeName; } catch (e) { return false; }
+            });
+            if (surface) {
+                this._surfaceContainer = surface;
+                this._surfacePositionId = surface.connect('notify::position', () => {
+                    surface.set_position(0, 0);
+                });
+                log(`lwpe: pinning surface container ${typeName} at (0,0)`);
+                return;
+            }
         }
-        // Disconnect window state signals
-        for (const id of this._signalIds) {
-            try { this.metaWindow?.disconnect(id); } catch (e) {}
+
+        // Log children types for debugging
+        const childTypes = children.map(c => {
+            try { return GObject.type_name(c); } catch (e) { return '?'; }
+        });
+        log(`lwpe: no surface container found, children: [${childTypes.join(', ')}]`);
+    }
+
+    _parseTitle() {
+        const title = getWindowTitle(this._window);
+        if (!title.startsWith(APPLICATION_ID)) return;
+
+        const json = title.substring(APPLICATION_ID.length);
+        try {
+            const newStates = JSON.parse(json);
+            this._states = {...this._states, ...newStates};
+        } catch (e) {
+            log(`lwpe: failed to parse renderer title: ${e.message}`);
         }
-        this._signalIds = [];
-        this._backgroundActor = null;
-        this.metaWindow = null;
-        this.windowActor = null;
+
+        this._refresh();
+    }
+
+    _refresh() {
+        if (this._states.keepAtBottom && this._window.above) {
+            this._window.unmake_above();
+        }
+        if (this._states.keepAtBottom) {
+            this._window.lower();
+        }
+        if (this._states.keepMinimized && !this._window.minimized) {
+            this._window.minimize();
+        }
+        if (this._states.keepPosition) {
+            const [x, y] = this._states.position;
+            this._window.move_frame(true, x, y);
+        }
+    }
+
+    disconnect() {
+        // The surface container may have been disposed by Mutter already;
+        // wrap in try/catch to avoid crashing on disposed objects.
+        if (this._surfaceContainer && this._surfacePositionId) {
+            try {
+                this._surfaceContainer.disconnect(this._surfacePositionId);
+            } catch (e) {
+                // surface container already disposed — nothing to do
+            }
+        }
+
+        this._signals.forEach(signal => {
+            try {
+                this._window.disconnect(signal);
+            } catch (e) {
+                // window may already be disposed
+            }
+        });
+        this._signals = [];
+        this._surfaceContainer = null;
+        this._surfacePositionId = 0;
+        this._window = null;
+    }
+}
+
+class WindowManager {
+    constructor() {
+        this._windows = new Set();
+        this._mapId = 0;
+    }
+
+    enable() {
+        this._mapId = global.window_manager.connect_after('map', (_wm, windowActor) => {
+            const window = windowActor.get_meta_window();
+            if (isRendererWindow(window)) {
+                this.addWindow(window);
+            }
+        });
+
+        let windowActors = [];
+        try {
+            windowActors = global.get_window_actors(false);
+        } catch (e) {
+            windowActors = global.get_window_actors();
+        }
+
+        windowActors.filter(isRendererActor).forEach(actor => this.addWindow(actor));
+    }
+
+    disable() {
+        this._windows.forEach(window => this._clearWindow(window));
+        this._windows.clear();
+
+        if (this._mapId) {
+            global.window_manager.disconnect(this._mapId);
+            this._mapId = 0;
+        }
+    }
+
+    addWindow(window) {
+        if (window.get_meta_window) {
+            window = window.get_meta_window();
+        }
+
+        if (this._windows.has(window)) return;
+
+        window.lwpeManaged = new ManagedWindow(window);
+        window.lwpeUnmanagedId = window.connect('unmanaged', _window => {
+            this._clearWindow(_window);
+            this._windows.delete(_window);
+        });
+        this._windows.add(window);
+    }
+
+    _clearWindow(window) {
+        if (!window.lwpeManaged) return;
+
+        window.disconnect(window.lwpeUnmanagedId);
+        window.lwpeManaged.disconnect();
+        window.lwpeManaged = null;
+        window.lwpeUnmanagedId = 0;
     }
 }
 
 export class WallpaperManager {
     constructor() {
-        this._wallpapers = new Map();
         this._injectionManager = new InjectionManager();
-        this._signalIds = [];
-        this._enabled = false;
+        this._wallpaperActors = new Set();
+        this._windowManager = new WindowManager();
 
-        this._discoverExistingWindows();
-        this._connectWindowSignals();
-        this._initBackgroundInjection();
-        this._initWindowHiding();
-        this._initAppSystemHiding();
-
-        this._enabled = true;
+        this._enable();
         log('lwpe: enabled');
     }
 
-    /* ------------------------------------------------------------------ */
-    /*  Window discovery                                                    */
-    /* ------------------------------------------------------------------ */
+    _reloadBackgrounds() {
+        this._wallpaperActors.forEach(actor => actor.destroy());
+        this._wallpaperActors.clear();
 
-    _parseTitle(title) {
-        if (!title || !title.startsWith(APPLICATION_ID)) return null;
+        try { Main.layoutManager._updateBackgrounds(); } catch (e) {}
+        try { Main.screenShield?._dialog?._updateBackgrounds?.(); } catch (e) {}
         try {
-            const jsonStart = title.indexOf('{');
-            if (jsonStart === -1) return null;
-            const info = JSON.parse(title.substring(jsonStart));
-            if (info.monitor) return info;
-        } catch (e) {
-            log(`lwpe: failed to parse window title: ${e}`);
-        }
-        return null;
+            Main.overview?._overview?._controls?._workspacesDisplay?._updateWorkspacesViews?.();
+        } catch (e) {}
     }
 
-    _discoverExistingWindows() {
-        const actors = global.get_window_actors();
-        for (const actor of actors) {
-            const metaWindow = actor.meta_window || actor.get_meta_window();
-            if (metaWindow) this._onWindowMapped(metaWindow, actor);
-        }
-    }
-
-    _onWindowMapped(metaWindow, actor) {
-        if (!metaWindow) return;
-        const title = metaWindow.get_title();
-        const info = this._parseTitle(title);
-        if (!info) return;
-
-        const monitorName = info.monitor;
-        log(`lwpe: found renderer window for ${monitorName}`);
-
-        if (this._wallpapers.has(monitorName)) {
-            this._wallpapers.get(monitorName).destroy();
-        }
-
-        const managed = new ManagedWallpaper(metaWindow, actor, info);
-        this._wallpapers.set(monitorName, managed);
-        this._tryInject(monitorName, managed);
-    }
-
-    _onWindowUnmapped(metaWindow) {
-        if (!metaWindow) return;
-        for (const [monitorName, managed] of this._wallpapers) {
-            if (managed.metaWindow === metaWindow) {
-                log(`lwpe: renderer window for ${monitorName} unmapped`);
-                managed.destroy();
-                this._wallpapers.delete(monitorName);
-                break;
-            }
-        }
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  Background injection                                               */
-    /* ------------------------------------------------------------------ */
-
-    _initBackgroundInjection() {
-        try {
-            const self = this;
-            this._injectionManager.overrideMethod(
-                Background.BackgroundManager.prototype,
-                '_createBackgroundActor',
-                originalMethod => {
-                    return function () {
-                        const actor = originalMethod.call(this);
-                        self._onBackgroundCreated(this, actor);
-                        return actor;
-                    };
-                }
-            );
-            log('lwpe: background injection active');
-        } catch (e) {
-            log(`lwpe: failed to inject background: ${e.message}`);
-        }
-    }
-
-    _onBackgroundCreated(bgManager, backgroundActor) {
-        if (!this._enabled) return;
-        const monitorName = this._getMonitorName(bgManager);
-        if (!monitorName) return;
-        const managed = this._wallpapers.get(monitorName);
-        if (managed) {
-            managed.inject(backgroundActor);
-        }
-    }
-
-    _tryInject(monitorName, managed) {
-        try {
-            const groups = Main.backgroundGroup?._backgroundGroupManagers || [];
-            for (const bgGroup of groups) {
-                const mgr = bgGroup._bgManager;
-                if (!mgr) continue;
-                if (this._getMonitorName(mgr) === monitorName) {
-                    const actor = mgr.actor || mgr._bgWidget;
-                    if (actor) { managed.inject(actor); return; }
-                }
-            }
-        } catch (e) { /* Background group not yet initialized */ }
-    }
-
-    _getMonitorName(bgManager) {
-        try {
-            const monitor = bgManager._monitor || bgManager.monitor;
-            if (!monitor) return null;
-            const monitorManager = Meta.MonitorManager.get();
-            if (!monitorManager) return null;
-            const monIndex = typeof monitor === 'number' ? monitor : monitor.index;
-            if (monIndex === undefined || monIndex === null) return null;
-            const logicalMonitor = monitorManager.get_logical_monitor_from_number(monIndex);
-            if (!logicalMonitor) return null;
-            const monitors = logicalMonitor.get_monitors();
-            if (monitors && monitors.length > 0 && monitors[0].get_connector()) {
-                return monitors[0].get_connector();
-            }
-        } catch (e) {
-            log(`lwpe: failed to get monitor name: ${e.message}`);
-        }
-        return null;
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  Window hiding from overview, Alt+Tab, workspace previews           */
-    /* ------------------------------------------------------------------ */
-
-    _isRendererTitle(title) {
-        return title && title.startsWith(APPLICATION_ID);
-    }
-
-    _initWindowHiding() {
-        // 1. Hide from get_window_actors (used by overview, workspaces)
-        try {
-            this._injectionManager.overrideMethod(
-                Shell.Global.prototype, 'get_window_actors',
-                originalMethod => {
-                    return function () {
-                        return originalMethod.call(this).filter(actor => {
-                            const win = actor.meta_window || actor.get_meta_window?.();
-                            if (!win) return true;
-                            const title = win.get_title?.() || win.title;
-                            return !(title && title.startsWith(APPLICATION_ID));
-                        });
-                    };
-                }
-            );
-        } catch (e) { log(`lwpe: get_window_actors override: ${e.message}`); }
-
-        // 2. Hide from Alt+Tab / Ctrl+Alt+Tab
-        try {
-            this._injectionManager.overrideMethod(
-                Meta.Display.prototype, 'get_tab_list',
-                originalMethod => {
-                    return function (type, workspace) {
-                        return originalMethod.call(this, type, workspace).filter(mw => {
-                            try {
-                                const title = mw.get_title?.() || mw.title;
-                                return !(title && title.startsWith(APPLICATION_ID));
-                            } catch (e) { return true; }
-                        });
-                    };
-                }
-            );
-        } catch (e) { log(`lwpe: get_tab_list override: ${e.message}`); }
-
-        // 3. Hide from workspace overview window previews
-        try {
-            this._injectionManager.overrideMethod(
-                Workspace.Workspace.prototype, '_isOverviewWindow',
-                originalMethod => {
-                    return function (window) {
-                        try {
-                            const title = window.get_title?.() || window.title;
-                            if (title && title.startsWith(APPLICATION_ID)) return false;
-                        } catch (e) {}
-                        return originalMethod.call(this, window);
-                    };
-                }
-            );
-        } catch (e) { log(`lwpe: Workspace._isOverviewWindow: ${e.message}`); }
-
-        // 4. Hide from workspace thumbnails
-        try {
-            this._injectionManager.overrideMethod(
-                WorkspaceThumbnail.WorkspaceThumbnail.prototype, '_isOverviewWindow',
-                originalMethod => {
-                    return function (window) {
-                        try {
-                            const title = window.get_title?.() || window.title;
-                            if (title && title.startsWith(APPLICATION_ID)) return false;
-                        } catch (e) {}
-                        return originalMethod.call(this, window);
-                    };
-                }
-            );
-        } catch (e) { log(`lwpe: WorkspaceThumbnail._isOverviewWindow: ${e.message}`); }
-
-        log('lwpe: window hiding active');
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  App system hiding — prevents dock/taskbar entry                    */
-    /* ------------------------------------------------------------------ */
-
-    _initAppSystemHiding() {
-        // 1. Prevent renderer windows from being associated with any app.
-        //    Without this, Mutter associates the window with an app by
-        //    app_id ("linux-wallpaperengine"), which creates a dock entry.
-        try {
-            this._injectionManager.overrideMethod(
-                Shell.WindowTracker.prototype, 'get_window_app',
-                originalMethod => {
-                    return function (window) {
-                        try {
-                            const title = window.get_title?.() || window.title;
-                            if (title && title.startsWith(APPLICATION_ID)) return null;
-                        } catch (e) {}
-                        return originalMethod.call(this, window);
-                    };
-                }
-            );
-        } catch (e) { log(`lwpe: WindowTracker.get_window_app: ${e.message}`); }
-
-        // 2. Exclude renderer windows from any app's window list
-        try {
-            const filterWindows = originalMethod => {
+    _enable() {
+        this._injectionManager.overrideMethod(
+            Background.BackgroundManager.prototype,
+            '_createBackgroundActor',
+            originalMethod => {
                 return function () {
-                    return originalMethod.call(this).filter(mw => {
-                        try {
-                            const title = mw.get_title?.() || mw.title;
-                            return !(title && title.startsWith(APPLICATION_ID));
-                        } catch (e) { return true; }
+                    const backgroundActor = originalMethod.call(this);
+                    this.videoActor = new LiveWallpaper(backgroundActor);
+
+                    const manager = global.lwpeWallpaperManager;
+                    manager?._wallpaperActors.add(this.videoActor);
+                    this.videoActor.connect('destroy', actor => {
+                        manager?._wallpaperActors.delete(actor);
                     });
+
+                    return backgroundActor;
                 };
-            };
+            }
+        );
 
-            this._injectionManager.overrideMethod(
-                Shell.App.prototype, 'get_windows', filterWindows
-            );
-            this._injectionManager.overrideMethod(
-                Shell.App.prototype, 'get_n_windows',
-                originalMethod => {
-                    return function () {
-                        return this.get_windows().length;
-                    };
-                }
-            );
-        } catch (e) { log(`lwpe: App.get_windows: ${e.message}`); }
+        this._injectionManager.overrideMethod(
+            Shell.Global.prototype,
+            'get_window_actors',
+            originalMethod => {
+                return function (hideRenderer = true) {
+                    const windowActors = originalMethod.call(this);
+                    return hideRenderer
+                        ? windowActors.filter(actor => !isRendererActor(actor))
+                        : windowActors;
+                };
+            }
+        );
 
-        // 3. Remove apps that have zero (non-renderer) windows from the dock
-        try {
-            this._injectionManager.overrideMethod(
-                Shell.AppSystem.prototype, 'get_running',
-                originalMethod => {
-                    return function () {
-                        return originalMethod.call(this).filter(
-                            app => app.get_n_windows() > 0
-                        );
-                    };
-                }
-            );
-        } catch (e) { log(`lwpe: AppSystem.get_running: ${e.message}`); }
+        this._injectionManager.overrideMethod(
+            Workspace.Workspace.prototype,
+            '_isOverviewWindow',
+            originalMethod => {
+                return function (window) {
+                    return isRendererWindow(window) ? false : originalMethod.apply(this, [window]);
+                };
+            }
+        );
 
-        log('lwpe: app system hiding active');
+        this._injectionManager.overrideMethod(
+            WorkspaceThumbnail.WorkspaceThumbnail.prototype,
+            '_isOverviewWindow',
+            originalMethod => {
+                return function (window) {
+                    return isRendererWindow(window) ? false : originalMethod.apply(this, [window]);
+                };
+            }
+        );
+
+        this._injectionManager.overrideMethod(
+            Meta.Display.prototype,
+            'get_tab_list',
+            originalMethod => {
+                return function (type, workspace) {
+                    return originalMethod.apply(this, [type, workspace])
+                        .filter(window => !isRendererWindow(window));
+                };
+            }
+        );
+
+        this._injectionManager.overrideMethod(
+            Shell.WindowTracker.prototype,
+            'get_window_app',
+            originalMethod => {
+                return function (window) {
+                    return isRendererWindow(window) ? null : originalMethod.apply(this, [window]);
+                };
+            }
+        );
+
+        this._injectionManager.overrideMethod(
+            Shell.App.prototype,
+            'get_windows',
+            originalMethod => {
+                return function () {
+                    return originalMethod.call(this).filter(window => !isRendererWindow(window));
+                };
+            }
+        );
+
+        this._injectionManager.overrideMethod(
+            Shell.App.prototype,
+            'get_n_windows',
+            _originalMethod => {
+                return function () {
+                    return this.get_windows().length;
+                };
+            }
+        );
+
+        this._injectionManager.overrideMethod(
+            Shell.AppSystem.prototype,
+            'get_running',
+            originalMethod => {
+                return function () {
+                    return originalMethod.call(this).filter(app => app.get_n_windows() > 0);
+                };
+            }
+        );
+
+        global.lwpeWallpaperManager = this;
+        this._windowManager.enable();
+        this._reloadBackgrounds();
     }
-
-    /* ------------------------------------------------------------------ */
-    /*  Signal connections                                                 */
-    /* ------------------------------------------------------------------ */
-
-    _connectWindowSignals() {
-        try {
-            const id = global.display.connect('window-created', (_display, metaWindow) => {
-                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                    const actor = metaWindow.get_compositor_private();
-                    if (actor) this._onWindowMapped(metaWindow, actor);
-                    return GLib.SOURCE_REMOVE;
-                });
-            });
-            this._signalIds.push({obj: global.display, id});
-        } catch (e) {
-            log(`lwpe: failed to connect window-created: ${e.message}`);
-        }
-
-        try {
-            const id = Main.layoutManager.connect('monitors-changed', () => {
-                try { Main.layoutManager._updateBackgrounds(); } catch (e) {}
-            });
-            this._signalIds.push({obj: Main.layoutManager, id});
-        } catch (e) {
-            log(`lwpe: failed to connect monitors-changed: ${e.message}`);
-        }
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  Cleanup                                                            */
-    /* ------------------------------------------------------------------ */
 
     destroy() {
-        this._enabled = false;
+        this._windowManager.disable();
+        this._injectionManager.clear();
+        this._reloadBackgrounds();
 
-        for (const managed of this._wallpapers.values()) {
-            managed.destroy();
+        if (global.lwpeWallpaperManager === this) {
+            global.lwpeWallpaperManager = null;
         }
-        this._wallpapers.clear();
-
-        if (this._injectionManager) {
-            this._injectionManager.clear();
-            this._injectionManager = null;
-        }
-
-        for (const {obj, id} of this._signalIds) {
-            if (obj && typeof obj.disconnect === 'function') {
-                try { obj.disconnect(id); } catch (e) {}
-            }
-        }
-        this._signalIds = [];
 
         log('lwpe: disabled');
     }

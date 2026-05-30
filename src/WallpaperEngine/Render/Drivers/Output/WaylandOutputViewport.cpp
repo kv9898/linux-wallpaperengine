@@ -288,6 +288,9 @@ std::string WaylandOutputViewport::buildWindowTitle () const {
     return "@linux-wallpaperengine!{\"monitor\":\"" + this->name
 	+ "\",\"width\":" + std::to_string (this->size.x * this->scale)
 	+ ",\"height\":" + std::to_string (this->size.y * this->scale)
+	+ ",\"position\":[" + std::to_string (this->globalPosition.x)
+	+ "," + std::to_string (this->globalPosition.y)
+	+ "],\"keepAtBottom\":true,\"keepMinimized\":true,\"keepPosition\":true"
 	+ "}";
 }
 
@@ -308,10 +311,18 @@ void WaylandOutputViewport::setupXdgWindow () {
     xdg_surface_add_listener (xdgSurface, &xdgSurfaceListener, this);
     xdg_toplevel_add_listener (xdgToplevel, &xdgToplevelListener, this);
 
+    // Initial commit must be clean (no buffer content) per xdg-shell spec.
+    // The compositor will respond with a configure event; our listener acks
+    // it so we can proceed with the EGL surface.
     wl_surface_commit (surface);
     wl_display_roundtrip (m_driver->getWaylandContext ()->display);
 
-    // After initial configure ack, we can create the EGL surface
+    // Now that the configure has been acked, set surface state and create EGL.
+    wl_region* opaqueRegion = wl_compositor_create_region (compositor);
+    wl_region_add (opaqueRegion, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_set_opaque_region (surface, opaqueRegion);
+    wl_region_destroy (opaqueRegion);
+
     eglWindow = wl_egl_window_create (surface, size.x * scale, size.y * scale);
     eglSurface = m_driver->getEGLContext ()->eglCreatePlatformWindowSurfaceEXT (
 	m_driver->getEGLContext ()->display, m_driver->getEGLContext ()->config, eglWindow, nullptr
@@ -360,8 +371,10 @@ void WaylandOutputViewport::swapOutput () {
     this->callbackInitialized = true;
 
     this->makeCurrent ();
-    frameCallback = wl_surface_frame (surface);
-    wl_callback_add_listener (frameCallback, &frameListener, this);
+    if (!frameCallback) {
+	frameCallback = wl_surface_frame (surface);
+	wl_callback_add_listener (frameCallback, &frameListener, this);
+    }
     eglSwapBuffers (m_driver->getEGLContext ()->display, this->eglSurface);
     wl_surface_set_buffer_scale (surface, scale);
     wl_surface_damage_buffer (surface, 0, 0, INT32_MAX, INT32_MAX);
