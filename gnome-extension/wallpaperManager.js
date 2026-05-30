@@ -65,6 +65,7 @@ const LiveWallpaper = GObject.registerClass({
         this._monitorIndex = backgroundActor.monitor;
         this._wallpaper = null;
         this._retryId = 0;
+        this._destroying = false;
 
         const monitor = Main.layoutManager.monitors[this._monitorIndex];
         this._monitorWidth = monitor?.width ?? backgroundActor.width;
@@ -77,37 +78,61 @@ const LiveWallpaper = GObject.registerClass({
     }
 
     _applyWallpaper() {
-        let _retryCount = 0;
+        // The retry loop runs forever. On each tick it checks whether the
+        // current clone's source is still alive and finds a new renderer
+        // window when the old one goes away.
+        let _firstRun = true;
         const operation = () => {
-            const source = this._getSource();
+            if (this._destroying) return GLib.SOURCE_REMOVE;
 
-            if (!source) {
-                _retryCount++;
-                if (_retryCount === 1 || _retryCount % 30 === 0) {
-                    log(`lwpe: retry #${_retryCount} — no renderer found for monitor ${this._monitorIndex}`);
-                }
-                return GLib.SOURCE_CONTINUE;
+            // Detect when the current clone's source has gone stale
+            const cloneSource = this._wallpaper?.get_source?.();
+            const sourceAlive = cloneSource && !this._isActorDisposed(cloneSource);
+
+            if (!sourceAlive && this._wallpaper) {
+                // Old renderer window is gone — tear down the clone
+                this._wallpaper.destroy();
+                this._wallpaper = null;
+                log(`lwpe: renderer gone on monitor ${this._monitorIndex}`);
             }
 
-            this._wallpaper = new Clutter.Clone({
-                source,
-                pivot_point: new Graphene.Point({x: 0.5, y: 0.5}),
-            });
-            this._wallpaper.connect('destroy', () => {
-                this._wallpaper = null;
-            });
+            if (!this._wallpaper) {
+                const source = this._getSource();
+                if (source) {
+                    this._wallpaper = new Clutter.Clone({
+                        source,
+                        pivot_point: new Graphene.Point({x: 0.5, y: 0.5}),
+                    });
+                    this._wallpaper.connect('destroy', () => {
+                        this._wallpaper = null;
+                    });
 
-            this._wallpaper.set_size(this._monitorWidth, this._monitorHeight);
-            this.add_child(this._wallpaper);
-            this._fade();
-            this._retryId = 0;
-            log(`lwpe: wallpaper applied on monitor ${this._monitorIndex}`);
+                    this._wallpaper.set_size(this._monitorWidth, this._monitorHeight);
+                    this.add_child(this._wallpaper);
+                    this._fade();
+                    log(`lwpe: wallpaper applied on monitor ${this._monitorIndex}`);
+                } else if (_firstRun) {
+                    log(`lwpe: no renderer yet for monitor ${this._monitorIndex}, retrying...`);
+                }
+            }
 
-            return GLib.SOURCE_REMOVE;
+            _firstRun = false;
+            return GLib.SOURCE_CONTINUE;
         };
 
-        if (operation() === GLib.SOURCE_CONTINUE) {
-            this._retryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, operation);
+        this._retryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, operation);
+    }
+
+    /**
+     * Safely check whether a GObject actor has been disposed.
+     */
+    _isActorDisposed(actor) {
+        try {
+            // Accessing any property on a disposed object throws
+            void actor.get_parent?.();
+            return false;
+        } catch (e) {
+            return true;
         }
     }
 
@@ -188,9 +213,14 @@ const LiveWallpaper = GObject.registerClass({
     }
 
     destroy() {
+        this._destroying = true;
         if (this._retryId) {
             GLib.source_remove(this._retryId);
             this._retryId = 0;
+        }
+        if (this._wallpaper) {
+            this._wallpaper.destroy();
+            this._wallpaper = null;
         }
 
         super.destroy();
@@ -309,12 +339,22 @@ class ManagedWindow {
     }
 
     disconnect() {
+        // The surface container may have been disposed by Mutter already;
+        // wrap in try/catch to avoid crashing on disposed objects.
         if (this._surfaceContainer && this._surfacePositionId) {
-            this._surfaceContainer.disconnect(this._surfacePositionId);
+            try {
+                this._surfaceContainer.disconnect(this._surfacePositionId);
+            } catch (e) {
+                // surface container already disposed — nothing to do
+            }
         }
 
         this._signals.forEach(signal => {
-            this._window.disconnect(signal);
+            try {
+                this._window.disconnect(signal);
+            } catch (e) {
+                // window may already be disposed
+            }
         });
         this._signals = [];
         this._surfaceContainer = null;
