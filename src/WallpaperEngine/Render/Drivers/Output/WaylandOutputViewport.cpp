@@ -289,6 +289,9 @@ std::string WaylandOutputViewport::buildWindowTitle () const {
     return "@linux-wallpaperengine!{\"monitor\":\"" + this->name
 	+ "\",\"width\":" + std::to_string (this->size.x * this->scale)
 	+ ",\"height\":" + std::to_string (this->size.y * this->scale)
+	+ ",\"position\":[" + std::to_string (this->globalPosition.x)
+	+ "," + std::to_string (this->globalPosition.y)
+	+ "],\"keepAtBottom\":true,\"keepMinimized\":true,\"keepPosition\":true"
 	+ "}";
 }
 
@@ -297,6 +300,10 @@ void WaylandOutputViewport::setupXdgWindow () {
     auto* const wmBase = m_driver->getWaylandContext ()->wmBase;
 
     surface = wl_compositor_create_surface (compositor);
+
+    wl_region* inputRegion = wl_compositor_create_region (compositor);
+    wl_surface_set_input_region (surface, inputRegion);
+    wl_region_destroy (inputRegion);
 
     xdgSurface = xdg_wm_base_get_xdg_surface (wmBase, surface);
     xdgToplevel = xdg_surface_get_toplevel (xdgSurface);
@@ -361,8 +368,10 @@ void WaylandOutputViewport::swapOutput () {
     this->callbackInitialized = true;
 
     this->makeCurrent ();
-    frameCallback = wl_surface_frame (surface);
-    wl_callback_add_listener (frameCallback, &frameListener, this);
+    if (!frameCallback) {
+	frameCallback = wl_surface_frame (surface);
+	wl_callback_add_listener (frameCallback, &frameListener, this);
+    }
     eglSwapBuffers (m_driver->getEGLContext ()->display, this->eglSurface);
     wl_surface_set_buffer_scale (surface, scale);
     wl_surface_damage_buffer (surface, 0, 0, INT32_MAX, INT32_MAX);
