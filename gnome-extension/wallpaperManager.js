@@ -173,8 +173,10 @@ class ManagedWindow {
             }
         }));
         this._signals.push(this._window.connect('notify::minimized', () => {
-            if (this._states.keepMinimized && !this._window.minimized) {
-                this._window.minimize();
+            if (this._states.keepMinimized) {
+                if (!this._window.minimized) this._window.minimize();
+            } else {
+                if (this._window.minimized) this._window.unminimize();
             }
         }));
         this._signals.push(this._window.connect('position-changed', () => {
@@ -222,8 +224,10 @@ class ManagedWindow {
         if (this._states.keepAtBottom) {
             this._window.lower();
         }
-        if (this._states.keepMinimized && !this._window.minimized) {
-            this._window.minimize();
+        if (this._states.keepMinimized) {
+            if (!this._window.minimized) this._window.minimize();
+        } else {
+            if (this._window.minimized) this._window.unminimize();
         }
         if (this._states.keepPosition) {
             const [x, y] = this._states.position;
