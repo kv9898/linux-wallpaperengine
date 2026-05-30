@@ -51,7 +51,7 @@ static void mode (void* data, wl_output* output, uint32_t flags, int32_t width, 
     viewport->size = { width, height };
     viewport->viewport = { 0, 0, viewport->size.x * viewport->scale, viewport->size.y * viewport->scale };
 
-    if (viewport->layerSurface) {
+    if (viewport->layerSurface || viewport->xdgSurface) {
 	viewport->resize ();
     }
 
@@ -67,7 +67,7 @@ static void scale (void* data, wl_output* wl_output, int32_t scale) {
 
     viewport->scale = scale;
 
-    if (viewport->layerSurface) {
+    if (viewport->layerSurface || viewport->xdgSurface) {
 	viewport->resize ();
     }
 
@@ -110,6 +110,40 @@ constexpr wl_output_listener outputListener
 constexpr struct zwlr_layer_surface_v1_listener layerSurfaceListener = {
     .configure = handleLSConfigure,
     .closed = handleLSClosed,
+};
+
+static void handleXdgSurfaceConfigure (void* data, struct xdg_surface* surface, uint32_t serial) {
+    const auto viewport = static_cast<WaylandOutputViewport*> (data);
+    xdg_surface_ack_configure (surface, serial);
+
+    // Apply pending size from the last xdg_toplevel configure
+    viewport->viewport = { 0, 0, viewport->size.x * viewport->scale, viewport->size.y * viewport->scale };
+    viewport->resize ();
+}
+
+constexpr struct xdg_surface_listener xdgSurfaceListener = {
+    .configure = handleXdgSurfaceConfigure,
+};
+
+static void handleXdgToplevelConfigure (
+    void* data, struct xdg_toplevel* toplevel, int32_t width, int32_t height, struct wl_array* states
+) {
+    const auto viewport = static_cast<WaylandOutputViewport*> (data);
+
+    // A zero width/height means the compositor wants us to choose the size
+    if (width > 0 && height > 0) {
+	viewport->size = { width, height };
+    }
+}
+
+static void handleXdgToplevelClose (void* data, struct xdg_toplevel* toplevel) {
+    const auto viewport = static_cast<WaylandOutputViewport*> (data);
+    viewport->getDriver ()->onLayerClose (viewport);
+}
+
+constexpr struct xdg_toplevel_listener xdgToplevelListener = {
+    .configure = handleXdgToplevelConfigure,
+    .close = handleXdgToplevelClose,
 };
 
 static void xdgOutputLogicalPosition (void* data, struct zxdg_output_v1* xdg_output, int32_t x, int32_t y) {
@@ -250,6 +284,68 @@ void WaylandOutputViewport::setupLS () {
 }
 
 WaylandOpenGLDriver* WaylandOutputViewport::getDriver () const { return this->m_driver; }
+
+std::string WaylandOutputViewport::buildWindowTitle () const {
+    return "@linux-wallpaperengine!{\"monitor\":\"" + this->name
+	+ "\",\"width\":" + std::to_string (this->size.x * this->scale)
+	+ ",\"height\":" + std::to_string (this->size.y * this->scale)
+	+ "}";
+}
+
+void WaylandOutputViewport::setupXdgWindow () {
+    auto* const compositor = m_driver->getWaylandContext ()->compositor;
+    auto* const wmBase = m_driver->getWaylandContext ()->wmBase;
+
+    surface = wl_compositor_create_surface (compositor);
+
+    xdgSurface = xdg_wm_base_get_xdg_surface (wmBase, surface);
+    xdgToplevel = xdg_surface_get_toplevel (xdgSurface);
+
+    // Set window title with encoded metadata for the GNOME Shell extension
+    xdg_toplevel_set_title (xdgToplevel, buildWindowTitle ().c_str ());
+    xdg_toplevel_set_app_id (xdgToplevel, "linux-wallpaperengine");
+
+    // Listen for configure and close events
+    xdg_surface_add_listener (xdgSurface, &xdgSurfaceListener, this);
+    xdg_toplevel_add_listener (xdgToplevel, &xdgToplevelListener, this);
+
+    wl_surface_commit (surface);
+    wl_display_roundtrip (m_driver->getWaylandContext ()->display);
+
+    // After initial configure ack, we can create the EGL surface
+    eglWindow = wl_egl_window_create (surface, size.x * scale, size.y * scale);
+    eglSurface = m_driver->getEGLContext ()->eglCreatePlatformWindowSurfaceEXT (
+	m_driver->getEGLContext ()->display, m_driver->getEGLContext ()->config, eglWindow, nullptr
+    );
+
+    wl_surface_commit (surface);
+    wl_display_roundtrip (m_driver->getWaylandContext ()->display);
+
+    // Set up cursor
+    static const auto XCURSORSIZE = getenv ("XCURSOR_SIZE") ? std::stoi (getenv ("XCURSOR_SIZE")) : 24;
+    const auto PRCURSORTHEME
+	= wl_cursor_theme_load (getenv ("XCURSOR_THEME"), XCURSORSIZE * scale, m_driver->getWaylandContext ()->shm);
+
+    if (!PRCURSORTHEME) {
+	sLog.exception ("Failed to get a cursor theme");
+    }
+
+    pointer = wl_cursor_theme_get_cursor (PRCURSORTHEME, "left_ptr");
+    cursorSurface = wl_compositor_create_surface (compositor);
+
+    if (!cursorSurface) {
+	sLog.exception ("Failed to get a cursor surface");
+    }
+
+    if (eglMakeCurrent (
+	    m_driver->getEGLContext ()->display, eglSurface, eglSurface, m_driver->getEGLContext ()->context
+	)
+	== EGL_FALSE) {
+	sLog.exception ("Failed to make egl current");
+    }
+
+    this->m_driver->getOutput ().reset ();
+}
 
 void WaylandOutputViewport::makeCurrent () {
     const EGLBoolean result = eglMakeCurrent (
