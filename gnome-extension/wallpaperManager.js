@@ -77,10 +77,15 @@ const LiveWallpaper = GObject.registerClass({
     }
 
     _applyWallpaper() {
+        let _retryCount = 0;
         const operation = () => {
             const source = this._getSource();
 
             if (!source) {
+                _retryCount++;
+                if (_retryCount === 1 || _retryCount % 30 === 0) {
+                    log(`lwpe: retry #${_retryCount} — no renderer found for monitor ${this._monitorIndex}`);
+                }
                 return GLib.SOURCE_CONTINUE;
             }
 
@@ -107,28 +112,32 @@ const LiveWallpaper = GObject.registerClass({
     }
 
     /**
-     * Find the best source actor to clone.
+     * Find the MetaWindowActor to clone.
      *
-     * Cloning the MetaWindowActor directly has a problem: when the window is
-     * minimized, some Mutter versions make MetaWindowActor.paint() return
-     * early, producing a static snapshot in the clone.
+     * We clone the MetaWindowActor directly, just like gnome-ext-hanabi.
+     * The ManagedWindow keeps the window minimized and pins its surface
+     * container at (0,0) so the clone always paints the latest frame.
      *
-     * Instead we clone the *surface container* child of the window actor.
-     * This child holds the actual Wayland/X11 surface texture and its paint
-     * function doesn't check window state — it always paints the latest
-     * committed buffer.  The ManagedWindow pins this child at (0,0) so it
-     * stays accessible even while the window is minimized.
+     * Monitor matching is done first by meta_window.get_monitor() (index),
+     * and if that fails, by parsing the "monitor" name from the window
+     * title JSON and resolving it to a monitor index.
      */
     _getSource() {
         let windowActors = [];
         try {
             windowActors = global.get_window_actors(false);
         } catch (e) {
+            log(`lwpe: get_window_actors(false) threw: ${e.message}`);
             windowActors = global.get_window_actors();
         }
 
         const rendererActors = windowActors.filter(isRendererActor);
-        const renderer = rendererActors.find(actor => {
+        if (rendererActors.length === 0) {
+            return null;
+        }
+
+        // First try: match by monitor index
+        let renderer = rendererActors.find(actor => {
             try {
                 return actor.meta_window.get_monitor() === this._monitorIndex;
             } catch (e) {
@@ -136,33 +145,38 @@ const LiveWallpaper = GObject.registerClass({
             }
         });
 
-        if (!renderer) return null;
+        if (renderer) return renderer;
 
-        // Try known surface-container type names (Wayland → X11 fallback)
-        const children = renderer.get_children?.() ?? [];
-        const surfaceTypes = [
-            'MetaSurfaceContainerActorWayland',
-            'MetaSurfaceActorWayland',
-            'MetaSurfaceContainerActorX11',
-            'MetaSurfaceActorX11',
-        ];
-        for (const typeName of surfaceTypes) {
-            const surface = children.find(c => {
-                try { return GObject.type_name(c) === typeName; } catch (e) { return false; }
-            });
-            if (surface) {
-                log(`lwpe: cloning surface actor ${typeName}`);
-                return surface;
+        // Second try: parse monitor name from window title and resolve to index
+        const monitors = Main.layoutManager.monitors;
+        for (const actor of rendererActors) {
+            try {
+                const title = getWindowTitle(actor.meta_window);
+                const jsonStr = title.substring(APPLICATION_ID.length);
+                const info = JSON.parse(jsonStr);
+                if (info.monitor) {
+                    // Find the monitor index whose connector name matches
+                    const idx = monitors.findIndex(m => m?.connector === info.monitor);
+                    if (idx !== -1 && idx === this._monitorIndex) {
+                        log(`lwpe: matched renderer by connector "${info.monitor}" → monitor ${idx}`);
+                        return actor;
+                    }
+                    // Also log what monitors are available for debugging
+                    const connectors = monitors.map((m, i) => `[${i}]=${m?.connector || '?'}`).join(', ');
+                    log(`lwpe: renderer for "${info.monitor}", monitor ${this._monitorIndex}, available: ${connectors}`);
+                }
+            } catch (e) {
+                // Skip title parse errors
             }
         }
 
-        // Unknown surface type — log children for debugging & fall back
-        const childTypes = children.map(c => {
-            try { return GObject.type_name(c); } catch (e) { return '?'; }
-        });
-        log(`lwpe: no known surface child, children: [${childTypes.join(', ')}]`);
+        // Last resort: if we have exactly one renderer and one monitor, use it
+        if (rendererActors.length === 1 && monitors.length === 1) {
+            log('lwpe: falling back to single-renderer match');
+            return rendererActors[0];
+        }
 
-        return renderer;
+        return null;
     }
 
     _fade(visible = true) {
