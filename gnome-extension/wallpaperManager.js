@@ -22,13 +22,19 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Background from 'resource:///org/gnome/shell/ui/background.js';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import * as WorkspaceThumbnail from 'resource:///org/gnome/shell/ui/workspaceThumbnail.js';
 import {InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const APPLICATION_ID = '@linux-wallpaperengine!';
+const SHELL_VERSION = parseInt(Config.PACKAGE_VERSION.split('.')[0]);
 const BACKGROUND_FADE_ANIMATION_TIME = 1000;
+
+// Cached MetaWindowActors — fallback when Mutter removes minimized
+// actors from get_window_actors() on GNOME 50+.
+const _rendererActors = new Set();
 
 function getWindowTitle(window) {
     try {
@@ -156,9 +162,21 @@ const LiveWallpaper = GObject.registerClass({
             windowActors = global.get_window_actors();
         }
 
-        const rendererActors = windowActors.filter(isRendererActor);
+        let rendererActors = windowActors.filter(isRendererActor);
+
+        // Fall back to cached actors: on GNOME 50+ Mutter may remove
+        // minimized MetaWindowActors from get_window_actors().
         if (rendererActors.length === 0) {
-            return null;
+            rendererActors = [..._rendererActors].filter(actor => {
+                try {
+                    return !(actor.is_destroyed?.() ?? false) && isRendererActor(actor);
+                } catch (e) {
+                    return false;
+                }
+            });
+            if (rendererActors.length === 0) {
+                return null;
+            }
         }
 
         // First try: match by monitor index
@@ -266,12 +284,21 @@ class ManagedWindow {
             }
         }));
 
-        // GNOME 45+ (issue #3159): when a window is minimized, Mutter
-        // moves the surface container actor to a negative position to
-        // hide it.  We pin it at (0,0) so the Clutter.Clone — which
-        // now sources from this child directly — always sees the
-        // latest frame at the correct position.
-        this._pinSurfaceContainer();
+        // GNOME 45 issue #3159: when a window is minimized, Mutter moves
+        // the surface container to a negative position to hide it.  We
+        // pin it at (0,0) so the Clutter.Clone still sees the content.
+        // On GNOME 50+ this causes a feedback loop with minimize that
+        // destroys the MetaWindowActor.  Hanabi gates this too.
+        if (SHELL_VERSION === 45) {
+            this._pinSurfaceContainer();
+        }
+
+        // Cache MetaWindowActor before minimizing — on GNOME 50+ Mutter
+        // may remove minimized actors from get_window_actors().
+        const actor = this._window.get_compositor_private?.();
+        if (actor) {
+            _rendererActors.add(actor);
+        }
 
         this._parseTitle();
     }
@@ -415,6 +442,12 @@ class WindowManager {
     _clearWindow(window) {
         if (!window.lwpeManaged) return;
 
+        // Remove cached actor when the window is unmapped
+        const actor = window.get_compositor_private?.();
+        if (actor) {
+            _rendererActors.delete(actor);
+        }
+
         window.disconnect(window.lwpeUnmanagedId);
         window.lwpeManaged.disconnect();
         window.lwpeManaged = null;
@@ -444,112 +477,158 @@ export class WallpaperManager {
     }
 
     _enable() {
-        this._injectionManager.overrideMethod(
-            Background.BackgroundManager.prototype,
-            '_createBackgroundActor',
-            originalMethod => {
-                return function () {
-                    const backgroundActor = originalMethod.call(this);
-                    this.videoActor = new LiveWallpaper(backgroundActor);
+        // Each override wrapped individually so a single incompatible
+        // API won't disable the entire extension on startup (issue #4).
+        try {
+            this._injectionManager.overrideMethod(
+                Background.BackgroundManager.prototype,
+                '_createBackgroundActor',
+                originalMethod => {
+                    return function () {
+                        const backgroundActor = originalMethod.call(this);
+                        this.videoActor = new LiveWallpaper(backgroundActor);
+                        const manager = global.lwpeWallpaperManager;
+                        manager?._wallpaperActors.add(this.videoActor);
+                        this.videoActor.connect('destroy', actor => {
+                            manager?._wallpaperActors.delete(actor);
+                        });
+                        return backgroundActor;
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: _createBackgroundActor override FAILED: ${e.message}`);
+        }
 
-                    const manager = global.lwpeWallpaperManager;
-                    manager?._wallpaperActors.add(this.videoActor);
-                    this.videoActor.connect('destroy', actor => {
-                        manager?._wallpaperActors.delete(actor);
-                    });
+        try {
+            this._injectionManager.overrideMethod(
+                Shell.Global.prototype,
+                'get_window_actors',
+                originalMethod => {
+                    return function (hideRenderer = true) {
+                        const windowActors = originalMethod.call(this);
+                        return hideRenderer
+                            ? windowActors.filter(actor => !isRendererActor(actor))
+                            : windowActors;
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: get_window_actors override FAILED: ${e.message}`);
+        }
 
-                    return backgroundActor;
-                };
-            }
-        );
+        try {
+            this._injectionManager.overrideMethod(
+                Workspace.Workspace.prototype,
+                '_isOverviewWindow',
+                originalMethod => {
+                    return function (window) {
+                        return isRendererWindow(window) ? false : originalMethod.apply(this, [window]);
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: Workspace._isOverviewWindow override FAILED: ${e.message}`);
+        }
 
-        this._injectionManager.overrideMethod(
-            Shell.Global.prototype,
-            'get_window_actors',
-            originalMethod => {
-                return function (hideRenderer = true) {
-                    const windowActors = originalMethod.call(this);
-                    return hideRenderer
-                        ? windowActors.filter(actor => !isRendererActor(actor))
-                        : windowActors;
-                };
-            }
-        );
+        try {
+            this._injectionManager.overrideMethod(
+                WorkspaceThumbnail.WorkspaceThumbnail.prototype,
+                '_isOverviewWindow',
+                originalMethod => {
+                    return function (window) {
+                        return isRendererWindow(window) ? false : originalMethod.apply(this, [window]);
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: WorkspaceThumbnail._isOverviewWindow override FAILED: ${e.message}`);
+        }
 
-        this._injectionManager.overrideMethod(
-            Workspace.Workspace.prototype,
-            '_isOverviewWindow',
-            originalMethod => {
-                return function (window) {
-                    return isRendererWindow(window) ? false : originalMethod.apply(this, [window]);
-                };
-            }
-        );
+        try {
+            this._injectionManager.overrideMethod(
+                Meta.Display.prototype,
+                'get_tab_list',
+                originalMethod => {
+                    return function (type, workspace) {
+                        return originalMethod.apply(this, [type, workspace])
+                            .filter(window => !isRendererWindow(window));
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: get_tab_list override FAILED: ${e.message}`);
+        }
 
-        this._injectionManager.overrideMethod(
-            WorkspaceThumbnail.WorkspaceThumbnail.prototype,
-            '_isOverviewWindow',
-            originalMethod => {
-                return function (window) {
-                    return isRendererWindow(window) ? false : originalMethod.apply(this, [window]);
-                };
-            }
-        );
+        try {
+            this._injectionManager.overrideMethod(
+                Shell.WindowTracker.prototype,
+                'get_window_app',
+                originalMethod => {
+                    return function (window) {
+                        return isRendererWindow(window) ? null : originalMethod.apply(this, [window]);
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: get_window_app override FAILED: ${e.message}`);
+        }
 
-        this._injectionManager.overrideMethod(
-            Meta.Display.prototype,
-            'get_tab_list',
-            originalMethod => {
-                return function (type, workspace) {
-                    return originalMethod.apply(this, [type, workspace])
-                        .filter(window => !isRendererWindow(window));
-                };
-            }
-        );
+        try {
+            this._injectionManager.overrideMethod(
+                Shell.App.prototype,
+                'get_windows',
+                originalMethod => {
+                    return function () {
+                        return originalMethod.call(this).filter(window => !isRendererWindow(window));
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: App.get_windows override FAILED: ${e.message}`);
+        }
 
-        this._injectionManager.overrideMethod(
-            Shell.WindowTracker.prototype,
-            'get_window_app',
-            originalMethod => {
-                return function (window) {
-                    return isRendererWindow(window) ? null : originalMethod.apply(this, [window]);
-                };
-            }
-        );
+        try {
+            this._injectionManager.overrideMethod(
+                Shell.App.prototype,
+                'get_n_windows',
+                _originalMethod => {
+                    return function () {
+                        return this.get_windows().length;
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: App.get_n_windows override FAILED: ${e.message}`);
+        }
 
-        this._injectionManager.overrideMethod(
-            Shell.App.prototype,
-            'get_windows',
-            originalMethod => {
-                return function () {
-                    return originalMethod.call(this).filter(window => !isRendererWindow(window));
-                };
-            }
-        );
-
-        this._injectionManager.overrideMethod(
-            Shell.App.prototype,
-            'get_n_windows',
-            _originalMethod => {
-                return function () {
-                    return this.get_windows().length;
-                };
-            }
-        );
-
-        this._injectionManager.overrideMethod(
-            Shell.AppSystem.prototype,
-            'get_running',
-            originalMethod => {
-                return function () {
-                    return originalMethod.call(this).filter(app => app.get_n_windows() > 0);
-                };
-            }
-        );
+        try {
+            this._injectionManager.overrideMethod(
+                Shell.AppSystem.prototype,
+                'get_running',
+                originalMethod => {
+                    return function () {
+                        return originalMethod.call(this).filter(app => app.get_n_windows() > 0);
+                    };
+                }
+            );
+        } catch (e) {
+            log(`lwpe: AppSystem.get_running override FAILED: ${e.message}`);
+        }
 
         global.lwpeWallpaperManager = this;
-        this._windowManager.enable();
-        this._reloadBackgrounds();
+
+        try {
+            this._windowManager.enable();
+        } catch (e) {
+            log(`lwpe: windowManager.enable FAILED: ${e.message}`);
+        }
+
+        try {
+            this._reloadBackgrounds();
+        } catch (e) {
+            log(`lwpe: _reloadBackgrounds FAILED: ${e.message}`);
+        }
     }
 
     destroy() {
