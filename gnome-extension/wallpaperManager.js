@@ -483,6 +483,14 @@ export class WallpaperManager {
         try {
             Main.overview?._overview?._controls?._workspacesDisplay?._updateWorkspacesViews?.();
         } catch (e) {}
+
+        // Blur My Shell compatibility: emit signals so BMS re-samples
+        // the background with our LiveWallpaper included.  Hanabi does
+        // the same in their _reloadBackgrounds.
+        if (Main.extensionManager?._enabledExtensions?.includes?.('blur-my-shell@aunetx')) {
+            try { Main.layoutManager.emit('monitors-changed'); } catch (e) {}
+            try { global.display.emit('workareas-changed'); } catch (e) {}
+        }
     }
 
     _enable() {
@@ -626,13 +634,10 @@ export class WallpaperManager {
         }
 
         // Replace WorkspaceBackground._updateBorderRadius to show our
-        // LiveWallpaper instead of the static blurred background in the
-        // overview.  We do NOT call originalMethod — Hanabi does the
-        // same — because the default applies a Meta.Background blur.
-        //
-        // Also hide the Meta.Background child of the backgroundActor so
-        // the Shell's overview blur doesn't show the static wallpaper
-        // behind our clone.
+        // LiveWallpaper in the overview instead of the default static
+        // blurred background.  We do NOT call originalMethod — Hanabi
+        // does the same — because the default applies a Meta.Background
+        // blur that would cover our Clutter clone.
         try {
             this._injectionManager.overrideMethod(
                 Workspace.WorkspaceBackground.prototype,
@@ -640,21 +645,9 @@ export class WallpaperManager {
                 _originalMethod => {
                     return function () {
                         const video = this._bgManager?.videoActor;
+                        log(`lwpe: _updateBorderRadius called, video=${!!video}, hasClone=${!!(video?._wallpaper)}`);
                         if (video && video._wallpaper) {
                             video._wallpaper.set_size(video._monitorWidth, video._monitorHeight);
-                            // Hide the static Meta.Background behind our clone
-                            const bgActor = video._backgroundActor;
-                            if (bgActor && !bgActor.__lwpeBgHidden) {
-                                const children = bgActor.get_children();
-                                for (const child of children) {
-                                    try {
-                                        if (GObject.type_name(child).includes('Background')) {
-                                            child.hide();
-                                        }
-                                    } catch (e) {}
-                                }
-                                bgActor.__lwpeBgHidden = true;
-                            }
                         }
                     };
                 }
