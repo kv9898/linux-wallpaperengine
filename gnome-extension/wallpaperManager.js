@@ -81,12 +81,14 @@ const LiveWallpaper = GObject.registerClass({
         backgroundActor.add_child(this);
 
         this._applyWallpaper();
+        log(`lwpe: LiveWallpaper created for monitor ${this._monitorIndex} (${this._monitorWidth}x${this._monitorHeight})`);
     }
 
     _applyWallpaper() {
-        // The retry loop runs forever. On each tick it checks whether the
-        // current clone's source is still alive and finds a new renderer
-        // window when the old one goes away.
+        // Like Hanabi: try synchronously first so that workspace
+        // backgrounds created during overview open have their clone
+        // ready before _updateBorderRadius fires.  Then keep a
+        // perpetual retry loop for wallpaper change detection.
         let _firstRun = true;
         const operation = () => {
             if (this._destroying) return GLib.SOURCE_REMOVE;
@@ -112,7 +114,6 @@ const LiveWallpaper = GObject.registerClass({
                     this._wallpaper.connect('destroy', () => {
                         this._wallpaper = null;
                     });
-
                     this._wallpaper.set_size(this._monitorWidth, this._monitorHeight);
                     this.add_child(this._wallpaper);
                     this._fade();
@@ -126,6 +127,9 @@ const LiveWallpaper = GObject.registerClass({
             return GLib.SOURCE_CONTINUE;
         };
 
+        // Try immediately (sync) so clones are ready for overview transitions.
+        // Start the perpetual timer afterwards for wallpaper change detection.
+        operation();
         this._retryId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, operation);
     }
 
@@ -219,6 +223,11 @@ const LiveWallpaper = GObject.registerClass({
             return rendererActors[0];
         }
 
+        // Debug: log why _getSource failed (once per 30s per LiveWallpaper)
+        if (!this.__lastSourceFailLog || Date.now() - this.__lastSourceFailLog > 30000) {
+            this.__lastSourceFailLog = Date.now();
+            log(`lwpe: _getSource FAIL — monitorIndex=${this._monitorIndex}, rendererCount=${rendererActors.length}, monitorCount=${monitors.length}, cached=${_rendererActors.size}`);
+        }
         return null;
     }
 
@@ -474,6 +483,14 @@ export class WallpaperManager {
         try {
             Main.overview?._overview?._controls?._workspacesDisplay?._updateWorkspacesViews?.();
         } catch (e) {}
+
+        // Blur My Shell compatibility: emit signals so BMS re-samples
+        // the background with our LiveWallpaper included.  Hanabi does
+        // the same in their _reloadBackgrounds.
+        if (Main.extensionManager?._enabledExtensions?.includes?.('blur-my-shell@aunetx')) {
+            try { Main.layoutManager.emit('monitors-changed'); } catch (e) {}
+            try { global.display.emit('workareas-changed'); } catch (e) {}
+        }
     }
 
     _enable() {
@@ -614,6 +631,30 @@ export class WallpaperManager {
             );
         } catch (e) {
             log(`lwpe: AppSystem.get_running override FAILED: ${e.message}`);
+        }
+
+        // Replace WorkspaceBackground._updateBorderRadius to show our
+        // LiveWallpaper in the overview instead of the default static
+        // blurred background.  We do NOT call originalMethod — Hanabi
+        // does the same — because the default applies a Meta.Background
+        // blur that would cover our Clutter clone.
+        try {
+            this._injectionManager.overrideMethod(
+                Workspace.WorkspaceBackground.prototype,
+                '_updateBorderRadius',
+                _originalMethod => {
+                    return function () {
+                        const video = this._bgManager?.videoActor;
+                        log(`lwpe: _updateBorderRadius called, video=${!!video}, hasClone=${!!(video?._wallpaper)}`);
+                        if (video && video._wallpaper) {
+                            video._wallpaper.set_size(video._monitorWidth, video._monitorHeight);
+                        }
+                    };
+                }
+            );
+            log('lwpe: _updateBorderRadius override OK');
+        } catch (e) {
+            log(`lwpe: _updateBorderRadius override FAILED: ${e.message}`);
         }
 
         global.lwpeWallpaperManager = this;
